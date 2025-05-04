@@ -3,46 +3,32 @@
 set -e
 set -o pipefail
 
-# --- Stylish Logging ---
-# Check if tput is available for more advanced styling
-if command -v tput >/dev/null 2>&1; then
-    BOLD=$(tput bold)
-    UNDERLINE=$(tput smul)
-    NORMAL=$(tput sgr0)
-    RED=$(tput setaf 1)
-    GREEN=$(tput setaf 2)
-    YELLOW=$(tput setaf 3)
-    BLUE=$(tput setaf 4)
-    MAGENTA=$(tput setaf 5)
-    CYAN=$(tput setaf 6)
-    WHITE=$(tput setaf 7)
-else
-    BOLD="\033[1m"
-    UNDERLINE="\033[4m"
-    NORMAL="\033[0m"
-    RED="\033[1;31m"
-    GREEN="\033[1;32m"
-    YELLOW="\033[1;33m"
-    BLUE="\033[1;34m"
-    MAGENTA="\033[1;35m"
-    CYAN="\033[1;36m"
-    WHITE="\033[1;37m"
-fi
+# --- Terminal Colors ---
+BOLD="\033[1m"
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+CYAN="\033[1;36m"
+WHITE="\033[1;37m"
+NORMAL="\033[0m"
 
-log_step() { echo -e "\n${BLUE}${BOLD}>>> $1${NORMAL}"; }
+# --- Logging Functions ---
+log_header() { echo -e "\n${BOLD}${BLUE}=================================================${NORMAL}"; echo -e "${BOLD}${BLUE}# $1${NORMAL}"; echo -e "${BOLD}${BLUE}=================================================${NORMAL}"; }
+log_step() { echo -e "\n${BOLD}${BLUE}>>> $1${NORMAL}"; }
 log_info() { echo -e "${CYAN}    $1${NORMAL}"; }
-log_success() { echo -e "${GREEN}    $1${NORMAL}"; }
-log_warn() { echo -e "${YELLOW}    $1${NORMAL}"; }
-log_error() { echo -e "${RED}${BOLD}!!! ERROR: $1${NORMAL}"; } >&2
+log_success() { echo -e "${GREEN}    ✓ $1${NORMAL}"; }
+log_warn() { echo -e "${YELLOW}    ! $1${NORMAL}"; }
+log_error() { echo -e "${RED}${BOLD}!!! ERROR: $1${NORMAL}" >&2; }
 log_detail() { echo -e "${WHITE}      - $1${NORMAL}"; }
 
 # --- Cleanup Function ---
 cleanup() {
     log_info "Running cleanup..."
-    rm -f cuda-*.pin cuda-repo-*.deb cuda-keyring*.deb cuda_test cuda_test.cu
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
+    rm -f cuda-*.pin cuda-repo-*.deb cuda-keyring*.deb cuda_test cuda_test.cu
     log_info "Cleanup finished."
 }
 trap cleanup EXIT INT TERM
@@ -60,123 +46,122 @@ require_command() {
             apt-get update >/dev/null || log_warn "apt-get update failed."
             apt-get install -y "$2" >/dev/null || {
                 log_error "Failed to install '$2' which provides '$1'. Please install it manually and retry."
-                exit 1
+                return 1
             }
             log_success "Successfully installed '$2'."
-            if ! check_command "$1"; then
-                 log_error "Installation of '$2' succeeded but command '$1' is still not found. Please check your PATH or installation."
-                 exit 1
-            fi
         else
             log_error "Command '$1' not found, and 'apt-get' is not available to install '$2'. Please install '$1' manually."
-            exit 1
+            return 1
         fi
-    else
-        log_success "Command '$1' found: $(command -v $1)"
     fi
+    log_success "Command '$1' found: $(command -v $1)"
+    return 0
 }
 
-# --- Pre-flight Checks ---
-log_step "Performing Pre-flight Checks"
-
-if [ "$(id -u)" -ne 0 ]; then
-   log_error "This script must be run as root. Please use sudo."
-   exit 1
-fi
-log_success "Running as root."
-
-require_command wget wget
-require_command curl curl
-require_command dpkg dpkg
-require_command apt-get apt-utils
-require_command lsb_release lsb-release
-require_command lspci pciutils
+# --- Check Root Privileges ---
+check_root() {
+    log_step "Checking for Root Privileges"
+    
+    if [ "$(id -u)" -ne 0 ]; then
+        log_error "This script must be run as root. Please use sudo."
+        return 1
+    fi
+    log_success "Running as root."
+    return 0
+}
 
 # --- System Information ---
-log_step "Gathering System Information"
-
-# --- Detect Compatible CUDA Version from Driver ---
-log_step "Detecting Compatible CUDA Version from NVIDIA Driver"
-
-CUDA_VERSION_TARGET=""
-CUDA_VERSION_MAJOR_MINOR=""
-
-if check_command nvidia-smi; then
-    DETECTED_CUDA_VERSION=$(nvidia-smi | grep -oP 'CUDA Version: \K[\d.]+' || echo "")
-    if [ -n "$DETECTED_CUDA_VERSION" ]; then
-        CUDA_VERSION_TARGET="$DETECTED_CUDA_VERSION"
-        CUDA_VERSION_MAJOR_MINOR=$(echo "$CUDA_VERSION_TARGET" | sed 's/\./-/')
-        log_success "Detected compatible CUDA version from driver: $CUDA_VERSION_TARGET"
+gather_system_info() {
+    log_header "System Information"
+    
+    # --- OS Detection ---
+    if [ -f /etc/os-release ]; then
+        source /etc/os-release
+        OS_ID=$ID
+        OS_VERSION_ID=$VERSION_ID
+        OS_ID_LIKE=$ID_LIKE
+        log_info "OS detected: $PRETTY_NAME"
     else
-        log_warn "Could not parse CUDA version from nvidia-smi output."
+        log_warn "/etc/os-release not found. Attempting fallback detection."
+        if check_command lsb_release; then
+            OS_ID=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+            OS_VERSION_ID=$(lsb_release -rs)
+            log_info "OS detected using lsb_release: $OS_ID $OS_VERSION_ID"
+        else
+            log_error "Cannot determine operating system. This script requires /etc/os-release or lsb_release."
+            return 1
+        fi
     fi
-else
-    log_warn "nvidia-smi not found. Skipping CUDA version detection from driver."
-fi
 
-if [ -z "$CUDA_VERSION_TARGET" ]; then
-    CUDA_VERSION_TARGET="12.2"
-    CUDA_VERSION_MAJOR_MINOR="12-2"
-    log_warn "Falling back to default CUDA version: $CUDA_VERSION_TARGET"
-fi
-
-OS_ID=""
-OS_VERSION_ID=""
-OS_ID_LIKE=""
-if [ -f /etc/os-release ]; then
-    source /etc/os-release
-    OS_ID=$ID
-    OS_VERSION_ID=$VERSION_ID
-    OS_ID_LIKE=$ID_LIKE
-    log_info "OS detected from /etc/os-release: $PRETTY_NAME"
-else
-    log_warn "/etc/os-release not found. Attempting fallback detection."
-    if check_command lsb_release; then
-        OS_ID=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
-        OS_VERSION_ID=$(lsb_release -rs)
-        log_info "OS detected using lsb_release: $OS_ID $OS_VERSION_ID"
-    else
-        log_error "Cannot determine operating system. This script requires /etc/os-release or lsb_release."
-        exit 1
+    if [[ ! " $OS_ID $OS_ID_LIKE " =~ " debian " ]] && [[ ! " $OS_ID $OS_ID_LIKE " =~ " ubuntu " ]]; then
+        log_error "This script is designed for Debian/Ubuntu-based systems. Detected OS: $OS_ID. Aborting."
+        return 1
     fi
-fi
+    log_success "Debian/Ubuntu based system confirmed: $OS_ID $OS_VERSION_ID"
 
-if [[ ! " $OS_ID $OS_ID_LIKE " =~ " debian " ]] && [[ ! " $OS_ID $OS_ID_LIKE " =~ " ubuntu " ]]; then
-    log_error "This script is designed for Debian/Ubuntu-based systems. Detected OS: $OS_ID. Aborting."
-    exit 1
-fi
-log_success "Debian/Ubuntu based system confirmed."
+    # --- Architecture Check ---
+    ARCH=$(uname -m)
+    log_info "Architecture: $ARCH"
+    if [ "$ARCH" != "x86_64" ]; then
+        log_error "This script currently only supports x86_64 architecture. Detected: $ARCH. Aborting."
+        return 1
+    fi
+    log_success "Architecture x86_64 confirmed."
 
-ARCH=$(uname -m)
-log_info "Architecture: $ARCH"
-if [ "$ARCH" != "x86_64" ]; then
-    log_error "This script currently only supports x86_64 architecture. Detected: $ARCH. Aborting."
-    exit 1
-fi
-log_success "Architecture x86_64 confirmed."
-
-IS_WSL=false
-if grep -qi Microsoft /proc/version; then
-    log_warn "WSL environment detected. Ensure you have installed the appropriate NVIDIA drivers on your Windows host."
-    IS_WSL=true
-fi
+    # --- WSL Detection ---
+    IS_WSL=false
+    if grep -qi Microsoft /proc/version; then
+        log_warn "WSL environment detected. Ensure you have installed the appropriate NVIDIA drivers on your Windows host."
+        IS_WSL=true
+    fi
+    
+    return 0
+}
 
 # --- GPU Detection ---
-check_nvidia_gpu() {
-    log_step "Checking for NVIDIA GPU"
+detect_gpu() {
+    log_header "GPU Detection"
+    
     if check_command nvidia-smi; then
         log_success "NVIDIA GPU detected via nvidia-smi."
         log_info "GPU Details:"
         nvidia-smi --query-gpu=name,driver_version,pci.bus_id --format=csv,noheader | while IFS=, read -r name driver pci;
         do
-            log_detail "Name: $name, Driver: $driver, PCI ID: $pci"
+            log_detail "Name: $name, Driver Version: $driver, PCI ID: $pci"
         done
+        
+        # Extract driver version for later use
+        DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1 | tr -d '[:space:]')
+        log_success "NVIDIA Driver Version: $DRIVER_VERSION"
+        
+        # Extract CUDA compatibility version
+        CUDA_COMPAT_VERSION=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9.]+' || echo "unknown")
+        if [ "$CUDA_COMPAT_VERSION" != "unknown" ]; then
+            log_success "Driver CUDA Compatibility: $CUDA_COMPAT_VERSION"
+            # Set this as our target CUDA version for installation
+            CUDA_VERSION_TARGET=$CUDA_COMPAT_VERSION
+            CUDA_VERSION_MAJOR_MINOR=$(echo "$CUDA_VERSION_TARGET" | sed 's/\./-/')
+            log_success "Setting target CUDA version: $CUDA_VERSION_TARGET (Major-Minor: $CUDA_VERSION_MAJOR_MINOR)"
+        else
+            log_warn "Could not determine CUDA compatibility from driver."
+            # Default if we can't detect
+            CUDA_VERSION_TARGET="12.0"
+            CUDA_VERSION_MAJOR_MINOR="12-0"
+            log_warn "Using default CUDA version: $CUDA_VERSION_TARGET"
+        fi
+        
         return 0
     elif check_command lspci && lspci | grep -iq nvidia; then
         log_success "NVIDIA GPU detected via lspci (nvidia-smi not found)."
         log_info "GPU Details (from lspci):"
         lspci | grep -i nvidia | while IFS= read -r line; do log_detail "$line"; done
-        log_warn "nvidia-smi command not found. Driver might be missing or not loaded. CUDA installation might fail."
+        log_warn "nvidia-smi command not found. Driver might be missing or not loaded."
+        
+        # Default if we can't detect from driver
+        CUDA_VERSION_TARGET="12.0"
+        CUDA_VERSION_MAJOR_MINOR="12-0"
+        log_warn "Using default CUDA version: $CUDA_VERSION_TARGET"
+        
         return 0
     else
         log_error "No NVIDIA GPU detected via nvidia-smi or lspci."
@@ -185,251 +170,300 @@ check_nvidia_gpu() {
     fi
 }
 
-# --- CUDA Installation Check ---
-check_cuda_installed() {
-    log_step "Checking for Existing CUDA Installation"
-
-    local cuda_toolkit_found=false
-    local cuda_driver_found=false
-    local nvcc_path=""
-    local detected_cuda_version=""
-    local detected_driver_cuda_version=""
-
+# --- Existing CUDA Check ---
+check_existing_cuda() {
+    log_header "Checking for Existing CUDA Installations"
+    
+    # Create arrays to store found CUDA installations
+    declare -a CUDA_PATHS
+    declare -a CUDA_VERSIONS
+    FOUND_PATH_COUNT=0
+    
+    # Find installed CUDA via nvcc if it exists
     if check_command nvcc; then
-        cuda_toolkit_found=true
-        nvcc_path=$(command -v nvcc)
-        detected_cuda_version=$(nvcc --version | grep -oP 'release \K\d+\.\d+' || echo "unknown")
-        log_success "CUDA Toolkit (nvcc) found: Version $detected_cuda_version at $nvcc_path"
+        NVCC_PATH=$(command -v nvcc)
+        NVCC_VERSION=$(nvcc --version | grep -oP 'release \K\d+\.\d+' || echo "unknown")
+        CUDA_PATH=$(dirname "$(dirname "$NVCC_PATH")")
+        
+        log_success "Found CUDA Toolkit via nvcc:"
+        log_detail "Path: $CUDA_PATH"
+        log_detail "Version: $NVCC_VERSION"
+        log_detail "nvcc location: $NVCC_PATH"
+        
+        # Add to found paths
+        CUDA_PATHS[$FOUND_PATH_COUNT]=$CUDA_PATH
+        CUDA_VERSIONS[$FOUND_PATH_COUNT]=$NVCC_VERSION
+        FOUND_PATH_COUNT=$((FOUND_PATH_COUNT + 1))
     else
         log_warn "CUDA Toolkit (nvcc) not found in PATH."
     fi
-
-    if check_command nvidia-smi; then
-        cuda_driver_found=true
-        detected_driver_cuda_version=$(nvidia-smi | grep -oP 'CUDA Version: \K[0-9.]+' || echo "unknown")
-        log_success "NVIDIA driver found with CUDA compatibility: $detected_driver_cuda_version"
-    else
-        log_warn "NVIDIA driver (nvidia-smi) not found or not loaded."
-    fi
-
-    local found_paths=()
-    for path_prefix in /usr/local /opt /usr; do
+    
+    # Search common directories for CUDA installations
+    log_info "Searching common directories for CUDA installations..."
+    for dir_prefix in "/usr/local" "/opt" "/usr"; do
         while IFS= read -r -d $'\0' cuda_dir; do
-            if [ -f "$cuda_dir/bin/nvcc" ]; then
-                found_paths+=("$cuda_dir")
-                log_success "Found potential CUDA installation at: $cuda_dir"
-                if ! $cuda_toolkit_found; then
-                    cuda_toolkit_found=true # Found via path even if not in PATH
+            # Only process directories that look like CUDA installations
+            if [ -d "$cuda_dir/bin" ] && [ -f "$cuda_dir/bin/nvcc" ]; then
+                # Extract version from path if possible
+                dir_version=$(echo "$cuda_dir" | grep -oP 'cuda-\K[0-9.]+' || echo "unknown")
+                
+                # Get version from nvcc if available
+                if [ -x "$cuda_dir/bin/nvcc" ]; then
+                    nvcc_version=$("$cuda_dir/bin/nvcc" --version 2>/dev/null | grep -oP 'release \K\d+\.\d+' || echo "$dir_version")
+                else
+                    nvcc_version=$dir_version
+                fi
+                
+                log_success "Found CUDA installation:"
+                log_detail "Path: $cuda_dir"
+                log_detail "Version: $nvcc_version"
+                
+                # Add to found paths (if not already added from nvcc check)
+                if [ "$cuda_dir" != "${CUDA_PATHS[0]}" ]; then
+                    CUDA_PATHS[$FOUND_PATH_COUNT]=$cuda_dir
+                    CUDA_VERSIONS[$FOUND_PATH_COUNT]=$nvcc_version
+                    FOUND_PATH_COUNT=$((FOUND_PATH_COUNT + 1))
                 fi
             fi
-        done < <(find "$path_prefix" -maxdepth 1 -name 'cuda*' -type d -print0 2>/dev/null)
+        done < <(find "$dir_prefix" -maxdepth 1 -name 'cuda*' -type d -print0 2>/dev/null)
     done
-
-    if $cuda_toolkit_found && $cuda_driver_found; then
-        log_success "Existing CUDA Toolkit and compatible driver detected."
-        if [[ "$detected_cuda_version" == "$CUDA_VERSION_TARGET"* ]]; then
-            log_success "Detected version $detected_cuda_version matches target $CUDA_VERSION_TARGET. Installation likely not needed."
-            return 0 # Found matching version
-        elif [[ "$detected_cuda_version" != "unknown" ]]; then
-            log_warn "Detected CUDA version $detected_cuda_version differs from target $CUDA_VERSION_TARGET."
-            return 1 # Found different version
+    
+    # Report summary
+    if [ $FOUND_PATH_COUNT -gt 0 ]; then
+        log_info "Found $FOUND_PATH_COUNT CUDA installation(s):"
+        for ((i=0; i<FOUND_PATH_COUNT; i++)); do
+            log_detail "${CUDA_PATHS[$i]} (version: ${CUDA_VERSIONS[$i]})"
+        done
+        
+        # Check if any match our target version
+        MATCHING_INSTALL=""
+        for ((i=0; i<FOUND_PATH_COUNT; i++)); do
+            if [[ "${CUDA_VERSIONS[$i]}" == "$CUDA_VERSION_TARGET"* ]]; then
+                MATCHING_INSTALL="${CUDA_PATHS[$i]}"
+                log_success "Found a matching installation for target CUDA version $CUDA_VERSION_TARGET: $MATCHING_INSTALL"
+                break
+            fi
+        done
+        
+        # Remember what we found for later
+        CUDA_INSTALL_PATH=$MATCHING_INSTALL
+        
+        # Check for version mismatch with driver
+        if [ -z "$MATCHING_INSTALL" ]; then
+            log_warn "No CUDA installation matching driver compatibility version $CUDA_VERSION_TARGET was found."
+            return 1  # No matching version found
         else
-             log_warn "Could not determine exact version of installed CUDA Toolkit."
-             return 1 # Found but version unknown
+            return 0  # Matching version found
         fi
-    elif $cuda_toolkit_found; then
-        log_warn "CUDA Toolkit found, but NVIDIA driver (nvidia-smi) was not found or is not loaded."
-        return 1 # Toolkit only
-    elif $cuda_driver_found; then
-        log_warn "NVIDIA driver found, but CUDA Toolkit (nvcc) was not found."
-        return 1 # Driver only
     else
-        log_info "No existing CUDA Toolkit or NVIDIA driver detected."
-        return 2 # Nothing found
+        log_warn "No CUDA installations found."
+        return 2  # No installation found
     fi
 }
 
-# --- Installation Functions ---
-install_cuda_local_deb() {
-    log_step "Starting CUDA Installation (Method: Local Deb)"
+# --- Check for CUDA Runtime Libraries ---
+check_cuda_runtime() {
+    log_step "Checking for CUDA Runtime Libraries"
+    
+    # Check for libcudart
+    if ldconfig -p | grep -q libcudart; then
+        log_success "CUDA Runtime libraries found in system library path."
+        return 0
+    elif [ -n "$CUDA_INSTALL_PATH" ] && [ -d "$CUDA_INSTALL_PATH/lib64" ]; then
+        if [ -f "$CUDA_INSTALL_PATH/lib64/libcudart.so" ]; then
+            log_success "CUDA Runtime libraries found in CUDA installation directory."
+            return 0
+        fi
+    fi
+    
+    log_warn "CUDA Runtime libraries not found or not properly linked."
+    return 1
+}
 
-    local PIN_FILE=""
-    local PIN_URL=""
-    local DEB_FILE=""
-    local DEB_URL=""
-    local OS_NAME_FOR_REPO=""
-    local OS_VERSION_FOR_REPO=""
-
-    if [ "$IS_WSL" = true ]; then
-        log_info "Configuring for WSL installation..."
-        OS_NAME_FOR_REPO="wsl-ubuntu"
-        PIN_FILE="cuda-${OS_NAME_FOR_REPO}.pin"
-        PIN_URL="https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME_FOR_REPO}/x86_64/${PIN_FILE}"
-        DEB_FILE="cuda-repo-${OS_NAME_FOR_REPO}-${CUDA_VERSION_MAJOR_MINOR}-local_${CUDA_VERSION_TARGET}.0-1_amd64.deb"
-        DEB_URL="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION_TARGET}.0/local_installers/${DEB_FILE}"
+# --- Check CUDA PATH Setup ---
+check_cuda_path() {
+    log_step "Checking CUDA PATH Configuration"
+    
+    local missing_path=true
+    
+    # Check if CUDA bin is in PATH
+    if [ -n "$CUDA_INSTALL_PATH" ]; then
+        if echo "$PATH" | grep -q "$CUDA_INSTALL_PATH/bin"; then
+            log_success "CUDA bin directory is in PATH: $CUDA_INSTALL_PATH/bin"
+            missing_path=false
+        else
+            log_warn "CUDA bin directory is NOT in PATH: $CUDA_INSTALL_PATH/bin"
+        fi
+        
+        # Check if CUDA lib64 is in LD_LIBRARY_PATH
+        if echo "$LD_LIBRARY_PATH" | grep -q "$CUDA_INSTALL_PATH/lib64"; then
+            log_success "CUDA lib64 directory is in LD_LIBRARY_PATH: $CUDA_INSTALL_PATH/lib64"
+            missing_path=false
+        else
+            log_warn "CUDA lib64 directory is NOT in LD_LIBRARY_PATH: $CUDA_INSTALL_PATH/lib64"
+        fi
     else
-        case $OS_VERSION_ID in
-            24.04*)
-                OS_NAME_FOR_REPO="ubuntu2404"
-                OS_VERSION_FOR_REPO="2404"
-                ;;
-            22.04*)
-                OS_NAME_FOR_REPO="ubuntu2204"
-                OS_VERSION_FOR_REPO="2204"
-                ;;
-            20.04*)
-                OS_NAME_FOR_REPO="ubuntu2004"
-                OS_VERSION_FOR_REPO="2004"
-                ;;
-            18.04*)
-                OS_NAME_FOR_REPO="ubuntu1804"
-                OS_VERSION_FOR_REPO="1804"
-                ;;
-            *)
-                log_warn "Unsupported Ubuntu/Debian version: $OS_VERSION_ID. Falling back to Ubuntu 22.04 configuration."
-                OS_NAME_FOR_REPO="ubuntu2204"
-                OS_VERSION_FOR_REPO="2204"
-                ;;
-        esac
-        log_info "Configuring for $OS_NAME_FOR_REPO..."
-        PIN_FILE="cuda-${OS_NAME_FOR_REPO}.pin"
-        PIN_URL="https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME_FOR_REPO}/x86_64/${PIN_FILE}"
-        # Note: The exact deb filename might vary slightly based on driver version bundled
-        # We will try a pattern or rely on the alternative method if this specific name fails.
-        # Constructing a likely name based on common patterns:
-        DEB_FILE_PATTERN="cuda-repo-${OS_NAME_FOR_REPO}-${CUDA_VERSION_MAJOR_MINOR}-local_${CUDA_VERSION_TARGET}*.deb"
-        DEB_URL_BASE="https://developer.download.nvidia.com/compute/cuda/${CUDA_VERSION_TARGET}.0/local_installers/"
-        # Attempt to find the exact DEB URL - this is fragile
-        # A better approach might be to use the network repo method first
-        DEB_FILE="cuda-repo-${OS_NAME_FOR_REPO}-${CUDA_VERSION_MAJOR_MINOR}-local_${CUDA_VERSION_TARGET}.0-1_amd64.deb" # Default guess
-        if [[ "$OS_VERSION_FOR_REPO" == "2404" ]]; then
-             # Example for 24.04, might need adjustment based on actual NVIDIA releases
-             DEB_FILE="cuda-repo-ubuntu2404-${CUDA_VERSION_MAJOR_MINOR}-local_${CUDA_VERSION_TARGET}.0-*.deb" # Use wildcard
-             # Need a way to fetch the exact name or use network repo
-             log_warn "Local deb filename for Ubuntu 24.04 is uncertain. Download might fail. Consider network repo method."
-             # Fallback to a known older version's naming scheme as a guess
-             DEB_FILE="cuda-repo-ubuntu2404-${CUDA_VERSION_MAJOR_MINOR}-local_${CUDA_VERSION_TARGET}.0-555.42.02-1_amd64.deb" # Example, likely wrong
-        fi
-        DEB_URL="${DEB_URL_BASE}${DEB_FILE}"
-
-    fi
-
-    log_info "Downloading repository pin file: $PIN_FILE"
-    log_detail "URL: $PIN_URL"
-    rm -f "$PIN_FILE"
-    if ! wget --quiet "$PIN_URL" -O "$PIN_FILE"; then
-        log_warn "wget failed for pin file, trying curl..."
-        if ! curl -fsSL "$PIN_URL" -o "$PIN_FILE"; then
-            log_error "Failed to download pin file: $PIN_FILE from $PIN_URL"
-            return 1
-        fi
-    fi
-    log_success "Downloaded $PIN_FILE."
-
-    log_info "Setting up repository preferences..."
-    mkdir -p /etc/apt/preferences.d
-    if ! cp "$PIN_FILE" /etc/apt/preferences.d/cuda-repository-pin-600; then
-        log_error "Failed to copy $PIN_FILE to /etc/apt/preferences.d/"
-        rm -f "$PIN_FILE"
+        log_warn "No valid CUDA installation path identified. Cannot check PATH configuration."
         return 1
     fi
-    log_success "Repository preferences set."
-
-    log_info "Downloading CUDA local repository package: $DEB_FILE"
-    log_detail "URL: $DEB_URL"
-    rm -f "$DEB_FILE"
-    if ! wget --progress=bar:force "$DEB_URL" -O "$DEB_FILE"; then
-        log_warn "wget failed for deb file, trying curl..."
-        if ! curl -L --progress-bar "$DEB_URL" -o "$DEB_FILE"; then
-             log_error "Failed to download CUDA local repository package: $DEB_FILE from $DEB_URL"
-             log_error "This might be due to an incorrect filename guess or network issues."
-             rm -f "$PIN_FILE" "$DEB_FILE"
-             return 1
-        fi
-    fi
-
-    if [ ! -f "$DEB_FILE" ] || [ ! -s "$DEB_FILE" ]; then
-        log_error "Downloaded file $DEB_FILE is missing or empty."
-        rm -f "$PIN_FILE" "$DEB_FILE"
+    
+    if $missing_path; then
         return 1
     fi
-    log_success "Downloaded $DEB_FILE."
-
-    log_info "Installing CUDA local repository package..."
-    if ! dpkg -i "$DEB_FILE"; then
-        log_error "Failed to install $DEB_FILE. Attempting dependency fix..."
-        if ! apt-get --fix-broken install -y; then
-             log_error "'apt-get --fix-broken install' failed. Cannot proceed with local deb method."
-             rm -f "$PIN_FILE" "$DEB_FILE"
-             return 1
-        fi
-        # Retry dpkg install after fixing dependencies
-        if ! dpkg -i "$DEB_FILE"; then
-            log_error "Failed to install $DEB_FILE even after fixing dependencies."
-            rm -f "$PIN_FILE" "$DEB_FILE"
-            return 1
-        fi
-    fi
-    log_success "Installed $DEB_FILE."
-
-    log_info "Copying repository keys..."
-    local key_copied=false
-    for key_path in /var/cuda-repo-*/cuda-*-keyring.gpg; do
-        if [ -f "$key_path" ]; then
-            if ! cp "$key_path" /usr/share/keyrings/; then
-                log_error "Failed to copy CUDA keyring from $key_path"
-                rm -f "$PIN_FILE" "$DEB_FILE"
-                return 1
-            fi
-            log_success "Copied keyring from $key_path"
-            key_copied=true
-            break # Assume first one found is correct
-        fi
-    done
-    if ! $key_copied; then
-        log_error "Could not find CUDA keyring GPG file in /var/cuda-repo-*/."
-        rm -f "$PIN_FILE" "$DEB_FILE"
-        return 1
-    fi
-
-    log_info "Updating package list..."
-    if ! apt-get update; then
-        log_error "apt-get update failed after adding local CUDA repo."
-        rm -f "$PIN_FILE" "$DEB_FILE"
-        return 1
-    fi
-    log_success "Package list updated."
-
-    log_info "Installing CUDA Toolkit $CUDA_VERSION_TARGET..."
-    log_warn "This may take several minutes. Please be patient."
-    local cuda_package="cuda-toolkit-${CUDA_VERSION_MAJOR_MINOR}"
-    if ! apt-get install -y "$cuda_package"; then
-        log_warn "Installation of $cuda_package failed. Trying generic 'cuda' package..."
-        if ! apt-get install -y cuda; then
-            log_error "Failed to install CUDA Toolkit using both specific and generic package names."
-            rm -f "$PIN_FILE" "$DEB_FILE"
-            return 1
-        fi
-        log_success "Installed CUDA using generic 'cuda' package."
-    else
-        log_success "Installed $cuda_package successfully."
-    fi
-
-    log_success "CUDA Toolkit installed successfully via Local Deb method!"
-    rm -f "$PIN_FILE" "$DEB_FILE"
     return 0
 }
 
-install_cuda_network_repo() {
-    log_step "Starting CUDA Installation (Method: Network Repo)"
+# --- Setup PATH for this session ---
+setup_current_session_path() {
+    log_step "Setting up CUDA PATH for Current Session"
+    
+    if [ -z "$CUDA_INSTALL_PATH" ] || [ ! -d "$CUDA_INSTALL_PATH" ]; then
+        log_error "No valid CUDA installation path available to set up PATH."
+        return 1
+    fi
+    
+    # Add CUDA bin to PATH if not already there
+    if ! echo "$PATH" | grep -q "$CUDA_INSTALL_PATH/bin"; then
+        export PATH="$CUDA_INSTALL_PATH/bin${PATH:+:${PATH}}"
+        log_success "Added $CUDA_INSTALL_PATH/bin to PATH for current session."
+    else
+        log_info "$CUDA_INSTALL_PATH/bin already in PATH."
+    fi
+    
+    # Add CUDA lib64 to LD_LIBRARY_PATH if not already there
+    if ! echo "$LD_LIBRARY_PATH" | grep -q "$CUDA_INSTALL_PATH/lib64"; then
+        export LD_LIBRARY_PATH="$CUDA_INSTALL_PATH/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        log_success "Added $CUDA_INSTALL_PATH/lib64 to LD_LIBRARY_PATH for current session."
+    else
+        log_info "$CUDA_INSTALL_PATH/lib64 already in LD_LIBRARY_PATH."
+    fi
+    
+    # Verify nvcc is now in PATH
+    if check_command nvcc; then
+        log_success "nvcc is now available in PATH: $(command -v nvcc)"
+        nvcc --version
+        return 0
+    else
+        log_error "nvcc still not available in PATH after setting environment variables."
+        return 1
+    fi
+}
 
-    local OS_NAME_FOR_REPO=""
-    local REPO_URL=""
-    local KEYRING_URL=""
-    local KEYRING_FILE="cuda-keyring.deb"
+# --- Configure Path for Future Sessions ---
+setup_path_persistently() {
+    log_step "Setting up CUDA PATH Persistently"
+    
+    if [ -z "$CUDA_INSTALL_PATH" ] || [ ! -d "$CUDA_INSTALL_PATH" ]; then
+        log_error "No valid CUDA installation path available to set up persistent PATH."
+        return 1
+    fi
+    
+    # Create CUDA profile script
+    log_info "Creating CUDA profile script for all users..."
+    
+    cat > /etc/profile.d/cuda.sh << EOL
+#!/bin/sh
+# CUDA Environment Variables - Added by CUDA setup script
+export PATH="$CUDA_INSTALL_PATH/bin\${PATH:+:\${PATH}}"
+export LD_LIBRARY_PATH="$CUDA_INSTALL_PATH/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+EOL
+    
+    chmod +x /etc/profile.d/cuda.sh
+    log_success "Created /etc/profile.d/cuda.sh"
+    
+    # Update ldconfig
+    log_info "Updating dynamic linker configuration..."
+    
+    if [ ! -f "/etc/ld.so.conf.d/cuda.conf" ]; then
+        echo "$CUDA_INSTALL_PATH/lib64" > /etc/ld.so.conf.d/cuda.conf
+        ldconfig
+        log_success "Created /etc/ld.so.conf.d/cuda.conf and ran ldconfig"
+    else
+        log_info "File /etc/ld.so.conf.d/cuda.conf already exists. Checking content..."
+        if ! grep -q "$CUDA_INSTALL_PATH/lib64" /etc/ld.so.conf.d/cuda.conf; then
+            echo "$CUDA_INSTALL_PATH/lib64" >> /etc/ld.so.conf.d/cuda.conf
+            ldconfig
+            log_success "Updated /etc/ld.so.conf.d/cuda.conf and ran ldconfig"
+        else
+            log_info "CUDA lib64 path already in /etc/ld.so.conf.d/cuda.conf"
+        fi
+    fi
+    
+    # User-specific configuration
+    if [ -n "$SUDO_USER" ]; then
+        USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+        
+        log_info "Configuring for user: $SUDO_USER (home: $USER_HOME)"
+        
+        # Check common profile files
+        for profile_file in "$USER_HOME/.bashrc" "$USER_HOME/.zshrc" "$USER_HOME/.profile"; do
+            if [ -f "$profile_file" ]; then
+                if ! grep -q "CUDA.*PATH" "$profile_file"; then
+                    log_info "Updating $profile_file..."
+                    cat >> "$profile_file" << EOL
 
-     if [ "$IS_WSL" = true ]; then
-        log_info "Configuring for WSL installation..."
+# CUDA Environment Variables - Added by CUDA setup script
+export PATH="$CUDA_INSTALL_PATH/bin\${PATH:+:\${PATH}}"
+export LD_LIBRARY_PATH="$CUDA_INSTALL_PATH/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+EOL
+                    log_success "Updated $profile_file"
+                else
+                    log_info "CUDA PATH already configured in $profile_file"
+                fi
+            fi
+        done
+        
+        # Set ownership
+        chown "$SUDO_USER" "$USER_HOME/.bashrc" "$USER_HOME/.profile" 2>/dev/null || true
+    else
+        log_warn "No sudo user detected. Skipping user-specific profile configuration."
+    fi
+    
+    log_success "CUDA PATH has been configured persistently. Changes will take effect after logging out and back in."
+    log_info "To activate immediately for your user, run: source /etc/profile.d/cuda.sh"
+    
+    return 0
+}
+
+# --- Create Symbolic Links for Default CUDA Path ---
+create_cuda_symlink() {
+    log_step "Creating Default CUDA Symbolic Link"
+    
+    if [ -z "$CUDA_INSTALL_PATH" ] || [ ! -d "$CUDA_INSTALL_PATH" ]; then
+        log_error "No valid CUDA installation path available to create symlink."
+        return 1
+    fi
+    
+    # Create /usr/local/cuda -> actual installation dir
+    DEFAULT_CUDA_PATH="/usr/local/cuda"
+    
+    if [ -L "$DEFAULT_CUDA_PATH" ]; then
+        log_info "Symbolic link $DEFAULT_CUDA_PATH already exists, pointing to: $(readlink -f $DEFAULT_CUDA_PATH)"
+        if [ "$(readlink -f "$DEFAULT_CUDA_PATH")" = "$(readlink -f "$CUDA_INSTALL_PATH")" ]; then
+            log_success "Symbolic link already points to the correct installation: $CUDA_INSTALL_PATH"
+            return 0
+        else
+            log_warn "Symbolic link points to a different installation. Updating..."
+            rm "$DEFAULT_CUDA_PATH"
+        fi
+    elif [ -e "$DEFAULT_CUDA_PATH" ]; then
+        log_warn "$DEFAULT_CUDA_PATH exists but is not a symbolic link. Creating backup..."
+        mv "$DEFAULT_CUDA_PATH" "${DEFAULT_CUDA_PATH}.bak.$(date +%s)"
+    fi
+    
+    # Create the symlink
+    ln -sf "$CUDA_INSTALL_PATH" "$DEFAULT_CUDA_PATH"
+    log_success "Created symbolic link: $DEFAULT_CUDA_PATH -> $CUDA_INSTALL_PATH"
+    
+    return 0
+}
+
+# --- CUDA Installation ---
+install_cuda() {
+    log_header "Installing CUDA Toolkit $CUDA_VERSION_TARGET"
+    
+    # Determine OS-specific repository name
+    if [ "$IS_WSL" = true ]; then
         OS_NAME_FOR_REPO="wsl-ubuntu"
     else
         case $OS_VERSION_ID in
@@ -437,280 +471,380 @@ install_cuda_network_repo() {
             22.04*) OS_NAME_FOR_REPO="ubuntu2204" ;; 
             20.04*) OS_NAME_FOR_REPO="ubuntu2004" ;; 
             18.04*) OS_NAME_FOR_REPO="ubuntu1804" ;; 
-            *) log_warn "Unsupported Ubuntu/Debian version: $OS_VERSION_ID. Falling back to Ubuntu 22.04."; OS_NAME_FOR_REPO="ubuntu2204" ;; 
+            *) 
+                log_warn "Unsupported Ubuntu/Debian version: $OS_VERSION_ID. Falling back to Ubuntu 22.04."
+                OS_NAME_FOR_REPO="ubuntu2204" 
+                ;; 
         esac
     fi
-    log_info "Using configuration for: $OS_NAME_FOR_REPO"
-
-    REPO_URL="https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME_FOR_REPO}/x86_64/"
-    KEYRING_URL="${REPO_URL}cuda-keyring_1.1-1_all.deb"
-
-    log_info "Downloading CUDA apt keyring..."
-    log_detail "URL: $KEYRING_URL"
-    rm -f "$KEYRING_FILE"
-    if ! wget --progress=bar:force "$KEYRING_URL" -O "$KEYRING_FILE"; then
-        log_warn "wget failed for keyring, trying curl..."
-        if ! curl -L --progress-bar "$KEYRING_URL" -o "$KEYRING_FILE"; then
-            log_error "Failed to download keyring: $KEYRING_FILE from $KEYRING_URL"
-            rm -f "$KEYRING_FILE"
+    log_info "Using OS configuration: $OS_NAME_FOR_REPO"
+    
+    # 1. Install CUDA keyring
+    log_step "Installing CUDA repository keyring"
+    
+    KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/${OS_NAME_FOR_REPO}/x86_64/cuda-keyring_1.1-1_all.deb"
+    KEYRING_FILE="cuda-keyring.deb"
+    
+    log_info "Downloading keyring from $KEYRING_URL"
+    if ! wget --quiet "$KEYRING_URL" -O "$KEYRING_FILE"; then
+        log_warn "wget failed, trying curl..."
+        if ! curl -s -L "$KEYRING_URL" -o "$KEYRING_FILE"; then
+            log_error "Failed to download CUDA keyring. Please check your internet connection."
             return 1
         fi
     fi
-
-    if [ ! -f "$KEYRING_FILE" ] || [ ! -s "$KEYRING_FILE" ]; then
-        log_error "Downloaded file $KEYRING_FILE is missing or empty."
-        rm -f "$KEYRING_FILE"
-        return 1
-    fi
-    log_success "Downloaded $KEYRING_FILE."
-
-    log_info "Installing CUDA apt keyring..."
+    
+    log_info "Installing keyring..."
     if ! dpkg -i "$KEYRING_FILE"; then
-        log_error "Failed to install $KEYRING_FILE. Attempting dependency fix..."
-         if ! apt-get --fix-broken install -y; then
-             log_error "'apt-get --fix-broken install' failed. Cannot proceed with network repo method."
-             rm -f "$KEYRING_FILE"
-             return 1
-         fi
-         if ! dpkg -i "$KEYRING_FILE"; then
-             log_error "Failed to install $KEYRING_FILE even after fixing dependencies."
-             rm -f "$KEYRING_FILE"
-             return 1
-         fi
-    fi
-    log_success "Installed $KEYRING_FILE."
-
-    log_info "Updating package list..."
-    if ! apt-get update; then
-        log_error "apt-get update failed after adding network CUDA repo."
-        rm -f "$KEYRING_FILE"
+        log_error "Failed to install CUDA keyring."
         return 1
     fi
-    log_success "Package list updated."
-
-    log_info "Installing CUDA Toolkit $CUDA_VERSION_TARGET..."
-    log_warn "This may take several minutes. Please be patient."
+    rm -f "$KEYRING_FILE"
+    log_success "CUDA keyring installed successfully."
+    
+    # 2. Update apt and install CUDA
+    log_step "Updating package lists"
+    apt-get update
+    
+    log_step "Installing CUDA Toolkit $CUDA_VERSION_TARGET"
     local cuda_package="cuda-toolkit-${CUDA_VERSION_MAJOR_MINOR}"
+    
+    log_info "Installing package: $cuda_package"
+    log_warn "This may take several minutes. Please be patient."
+    
     if ! apt-get install -y "$cuda_package"; then
-        log_warn "Installation of $cuda_package failed. Trying generic 'cuda' package..."
+        log_warn "Installation of specific package $cuda_package failed. Trying generic 'cuda' package..."
         if ! apt-get install -y cuda; then
-            log_error "Failed to install CUDA Toolkit using both specific and generic package names."
-            rm -f "$KEYRING_FILE"
+            log_error "Failed to install CUDA Toolkit. Please check the error messages above."
             return 1
         fi
-        log_success "Installed CUDA using generic 'cuda' package."
-    else
-        log_success "Installed $cuda_package successfully."
     fi
-
-    log_success "CUDA Toolkit installed successfully via Network Repo method!"
-    rm -f "$KEYRING_FILE"
-    return 0
-}
-
-# --- Post-Installation Setup & Verification ---
-setup_cuda_env_instructions() {
-    log_step "Post-Installation: Environment Setup Instructions"
-
-    local cuda_install_path=""
-    if check_command nvcc; then
-        local nvcc_loc
-        nvcc_loc=$(command -v nvcc)
-        cuda_install_path=$(dirname "$(dirname "$nvcc_loc")")
-        log_info "Detected CUDA installation path: $cuda_install_path"
-    else
-        log_warn "nvcc not found in PATH after installation. Searching common locations..."
-        local potential_path=""
-        for path_prefix in /usr/local /opt /usr; do
-            while IFS= read -r -d $'\0' cuda_dir; do
-                if [ -f "$cuda_dir/bin/nvcc" ]; then
-                    potential_path="$cuda_dir"
-                    break 2 # Found one, exit both loops
-                fi
-            done < <(find "$path_prefix" -maxdepth 1 -name "cuda*${CUDA_VERSION_MAJOR_MINOR}*" -type d -print0 2>/dev/null)
-        done
-        if [ -n "$potential_path" ]; then
-             cuda_install_path=$potential_path
-             log_info "Found potential CUDA path: $cuda_install_path"
-        else
-             cuda_install_path="/usr/local/cuda-${CUDA_VERSION_TARGET}" # Fallback guess
-             log_warn "Could not automatically determine CUDA installation path. Assuming default: $cuda_install_path"
+    
+    # 3. Identify the installed CUDA path
+    log_step "Identifying installed CUDA path"
+    
+    # First try to find the CUDA path based on the target version
+    while IFS= read -r -d $'\0' cuda_dir; do
+        if [[ "$cuda_dir" == *"cuda-$CUDA_VERSION_TARGET"* ]] && [ -d "$cuda_dir/bin" ] && [ -f "$cuda_dir/bin/nvcc" ]; then
+            CUDA_INSTALL_PATH="$cuda_dir"
+            log_success "Found installed CUDA path matching target version: $CUDA_INSTALL_PATH"
+            break
         fi
+    done < <(find /usr/local /opt /usr -maxdepth 1 -name "cuda*${CUDA_VERSION_TARGET}*" -type d -print0 2>/dev/null)
+    
+    # If not found, try to find any CUDA installation
+    if [ -z "$CUDA_INSTALL_PATH" ]; then
+        while IFS= read -r -d $'\0' cuda_dir; do
+            if [ -d "$cuda_dir/bin" ] && [ -f "$cuda_dir/bin/nvcc" ]; then
+                CUDA_INSTALL_PATH="$cuda_dir"
+                log_success "Found installed CUDA path: $CUDA_INSTALL_PATH"
+                break
+            fi
+        done < <(find /usr/local /opt /usr -maxdepth 1 -name "cuda*" -type d -print0 2>/dev/null)
     fi
-
-    if [ -z "$cuda_install_path" ] || [ ! -d "$cuda_install_path" ]; then
-        log_error "Failed to determine a valid CUDA installation directory. Cannot provide environment setup instructions."
-        return 1
+    
+    # Fall back to default location if still not found
+    if [ -z "$CUDA_INSTALL_PATH" ]; then
+        CUDA_INSTALL_PATH="/usr/local/cuda-$CUDA_VERSION_TARGET"
+        log_warn "Could not find installed CUDA path. Assuming default: $CUDA_INSTALL_PATH"
     fi
-
-    log_info "To make CUDA available in your shell sessions, add the following lines to your shell profile (~/.bashrc, ~/.zshrc, ~/.profile, etc.):"
-    echo -e "${BOLD}"
-    echo -e "export PATH=\"${cuda_install_path}/bin\"]\${PATH:+:\${PATH}}"
-    echo -e "export LD_LIBRARY_PATH=\"${cuda_install_path}/lib64\"]\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
-    echo -e "${NORMAL}"
-    log_info "After adding these lines, reload your shell configuration (e.g., 'source ~/.bashrc') or log out and log back in."
-    log_warn "This script does NOT automatically modify your user profile files."
-
-    # Set for current session for verification
-    export PATH="${cuda_install_path}/bin"${PATH:+:${PATH}}
-    export LD_LIBRARY_PATH="${cuda_install_path}/lib64"${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
-    log_info "Environment variables set for the current script execution."
+    
+    log_success "CUDA installation completed successfully!"
     return 0
 }
 
+# --- Verify CUDA Installation ---
 verify_cuda() {
-    log_step "Verifying CUDA Installation"
-
+    log_header "Verifying CUDA Installation"
+    
+    # Check if nvcc is available
     if ! check_command nvcc; then
-        log_error "nvcc command not found in PATH. Verification failed."
-        log_error "Please ensure CUDA bin directory is in your PATH (see previous step)."
+        log_error "CUDA compiler (nvcc) not found in PATH after installation."
         return 1
     fi
+    
+    # Get nvcc version
+    NVCC_VERSION=$(nvcc --version | grep -oP 'release \K\d+\.\d+' || echo "unknown")
     log_success "CUDA compiler (nvcc) found: $(command -v nvcc)"
-    log_info "NVCC Version:"
-    nvcc --version
-
-    if ! check_command nvidia-smi; then
-        log_warn "nvidia-smi command not found. Cannot verify driver interaction."
-    else
-        log_success "NVIDIA driver (nvidia-smi) found: $(command -v nvidia-smi)"
-        log_info "NVIDIA SMI Output:"
-        nvidia-smi
-    fi
-
-    log_info "Attempting to compile and run a sample CUDA program..."
+    log_detail "NVCC Version: $NVCC_VERSION"
+    
+    # Create temp directory for test compilation
     TEMP_DIR=$(mktemp -d)
-    log_info "Using temporary directory: $TEMP_DIR"
-    pushd "$TEMP_DIR" > /dev/null
-
+    log_info "Using temporary directory for verification: $TEMP_DIR"
+    
+    # Change to temp directory
+    cd "$TEMP_DIR"
+    
+    # Create simple CUDA test program
+    log_step "Creating CUDA test program"
     cat > cuda_test.cu << 'EOL'
 #include <stdio.h>
 #include <cuda_runtime.h>
 
 __global__ void helloFromGPU() {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("Hello World from GPU! Thread %d, Block %d\n", threadIdx.x, blockIdx.x);
-    }
+    printf("Hello from GPU thread %d, block %d\n", threadIdx.x, blockIdx.x);
 }
 
 int main() {
-    printf("Hello World from CPU!\n");
+    // CPU Hello
+    printf("Hello from CPU!\n");
+    
+    // Get device count
     int deviceCount = 0;
-    cudaError_t err = cudaGetDeviceCount(&deviceCount);
-    if (err != cudaSuccess) {
-        printf("CUDA Error: %s\n", cudaGetErrorString(err));
-        printf("Could not enumerate CUDA devices. Is the driver loaded and compatible?\n");
+    cudaError_t error = cudaGetDeviceCount(&deviceCount);
+    if (error != cudaSuccess) {
+        printf("cudaGetDeviceCount failed: %s\n", cudaGetErrorString(error));
         return 1;
     }
-    if (deviceCount == 0) {
-        printf("No CUDA-capable devices found.\n");
-        return 1;
-    }
-    printf("Found %d CUDA device(s)\n", deviceCount);
     
+    // Report device info
+    printf("Found %d CUDA devices\n", deviceCount);
+    
+    // Launch kernel
     helloFromGPU<<<1, 1>>>();
-    err = cudaGetLastError(); // Check for kernel launch errors
-    if (err != cudaSuccess) {
-        printf("Kernel launch error: %s\n", cudaGetErrorString(err));
+    error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        printf("Kernel launch error: %s\n", cudaGetErrorString(error));
         return 1;
     }
     
-    err = cudaDeviceSynchronize(); // Wait for kernel to complete
-    if (err != cudaSuccess) {
-        printf("cudaDeviceSynchronize error: %s\n", cudaGetErrorString(err));
+    // Wait for GPU to finish
+    error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) {
+        printf("cudaDeviceSynchronize error: %s\n", cudaGetErrorString(error));
         return 1;
     }
     
-    printf("CUDA Test Program Completed Successfully.\n");
+    printf("CUDA test completed successfully!\n");
     return 0;
 }
 EOL
-    log_info "Created sample file: cuda_test.cu"
-
-    log_info "Compiling with nvcc..."
+    
+    # Compile CUDA test program
+    log_step "Compiling CUDA test program"
     if ! nvcc cuda_test.cu -o cuda_test; then
-        log_error "nvcc compilation failed."
-        popd > /dev/null
-        rm -rf "$TEMP_DIR"
+        log_error "Failed to compile CUDA test program. Check nvcc output above."
         return 1
     fi
-    log_success "Compilation successful: cuda_test executable created."
-
-    log_info "Running the compiled test program..."
-    if ! ./cuda_test; then
-        log_error "CUDA test program execution failed."
-        log_error "Check the output above for CUDA errors. Ensure drivers are loaded and compatible."
-        popd > /dev/null
-        rm -rf "$TEMP_DIR"
+    log_success "CUDA test program compiled successfully."
+    
+    # Run CUDA test program
+    log_step "Running CUDA test program"
+    ./cuda_test
+    
+    if [ $? -eq 0 ]; then
+        log_success "CUDA test program ran successfully!"
+        return 0
+    else
+        log_error "CUDA test program failed. See output above for details."
         return 1
     fi
+}
 
-    log_success "CUDA test program executed successfully!"
-    popd > /dev/null
-    rm -rf "$TEMP_DIR"
-    log_success "CUDA Verification Complete!"
+# --- Print System Info ---
+print_system_info() {
+    log_header "CUDA System Information"
+    
+    if check_command nvidia-smi; then
+        log_step "NVIDIA System Management Interface (nvidia-smi)"
+        nvidia-smi
+    else
+        log_warn "nvidia-smi not found in PATH."
+    fi
+    
+    if check_command nvcc; then
+        log_step "CUDA Compiler Information (nvcc)"
+        nvcc --version
+    else
+        log_warn "nvcc not found in PATH."
+    fi
+    
+    log_step "Environment Variables"
+    log_detail "PATH: $PATH"
+    log_detail "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+    
+    if [ -n "$CUDA_INSTALL_PATH" ]; then
+        log_detail "CUDA Installation Path: $CUDA_INSTALL_PATH"
+    fi
+    
+    log_step "CUDA Installations"
+    find /usr/local /opt /usr -maxdepth 1 -name "cuda*" -type d 2>/dev/null | while read -r dir; do
+        if [ -d "$dir/bin" ] && [ -f "$dir/bin/nvcc" ]; then
+            local version
+            version=$("$dir/bin/nvcc" --version 2>/dev/null | grep -oP 'release \K[0-9.]+' || echo "unknown")
+            log_detail "$dir (CUDA version: $version)"
+        fi
+    done
+    
+    # Check for CUDA libraries
+    log_step "CUDA Libraries"
+    ldconfig -p | grep -i cuda | head -n 10 | while read -r line; do
+        log_detail "$line"
+    done
+    
+    log_success "System information gathering complete."
+}
+
+# --- Print Usage Information ---
+print_usage() {
+    cat << EOL
+CUDA Setup Script
+Usage: sudo bash $0 [options]
+
+This script detects, installs, and configures NVIDIA CUDA on Debian/Ubuntu systems.
+
+Options:
+  --help          Show this help message and exit
+  --install       Force installation even if CUDA is already detected
+  --skip-verify   Skip the verification step after installation
+  --info-only     Only display system information, don't install or configure anything
+
+Example:
+  sudo bash $0 --install     # Force installation of CUDA
+EOL
+}
+
+# --- Print Final Instructions ---
+print_final_instructions() {
+    log_header "Next Steps"
+    
+    cat << EOL
+${BOLD}${GREEN}
+CUDA setup completed successfully!
+${NORMAL}
+
+${BOLD}To use CUDA in the current terminal session:${NORMAL}
+    source /etc/profile.d/cuda.sh
+
+${BOLD}To verify CUDA is working:${NORMAL}
+    nvcc --version
+    nvidia-smi
+
+${BOLD}The changes will take full effect after logging out and back in.${NORMAL}
+
+${BOLD}Important paths:${NORMAL}
+  • CUDA Installation: $CUDA_INSTALL_PATH
+  • CUDA Default Link: /usr/local/cuda
+
+${BOLD}If you encounter any issues:${NORMAL}
+  1. Check that the NVIDIA driver is properly installed
+  2. Ensure the CUDA paths are in your PATH and LD_LIBRARY_PATH
+  3. Verify your GPU is compatible with this CUDA version
+
+${BOLD}For development, you may want to install these additional packages:${NORMAL}
+  • NVIDIA cuDNN: High-performance neural network library
+    sudo apt install libcudnn8 libcudnn8-dev
+
+  • NVIDIA TensorRT: High-performance deep learning inference optimizer
+    sudo apt install libnvinfer8 libnvinfer-dev
+
+${BOLD}For Python development:${NORMAL}
+  • Install CUDA support for frameworks like PyTorch or TensorFlow
+    pip install torch torchvision torchaudio
+
+${YELLOW}Note: When installing ML frameworks, ensure they're compatible
+with your installed CUDA version: $NVCC_VERSION${NORMAL}
+EOL
+}
+
+# --- Run All Steps ---
+main() {
+    # Parse command line arguments
+    local force_install=false
+    local skip_verify=false
+    local info_only=false
+    
+    for arg in "$@"; do
+        case $arg in
+            --help)
+                print_usage
+                exit 0
+                ;;
+            --install)
+                force_install=true
+                ;;
+            --skip-verify)
+                skip_verify=true
+                ;;
+            --info-only)
+                info_only=true
+                ;;
+            *)
+                echo "Unknown option: $arg"
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Quick info only mode
+    if $info_only; then
+        if ! check_root; then
+            log_error "Root privileges required for system information."
+            exit 1
+        fi
+        gather_system_info
+        detect_gpu
+        check_existing_cuda
+        print_system_info
+        exit 0
+    fi
+    
+    # Regular execution
+    if ! check_root; then
+        log_error "This script must be run as root. Please use sudo."
+        exit 1
+    fi
+    
+    # Start workflow
+    gather_system_info || exit 1
+    detect_gpu || exit 1
+    
+    # Check if we need to install
+    local need_install=true
+    if check_existing_cuda; then
+        if $force_install; then
+            log_warn "CUDA already installed, but --install flag provided. Proceeding with installation."
+        else
+            log_success "Compatible CUDA installation found. Skipping installation."
+            need_install=false
+        fi
+    else
+        log_info "No compatible CUDA installation found. Proceeding with installation."
+    fi
+    
+    # Install CUDA if needed
+    if $need_install; then
+        # Install required packages for CUDA installation
+        log_step "Installing prerequisites"
+        apt-get update
+        apt-get install -y build-essential wget curl software-properties-common
+        
+        # Install CUDA
+        install_cuda || exit 1
+    fi
+    
+    # Set up environment
+    setup_current_session_path || log_warn "Failed to set up CUDA path for current session."
+    setup_path_persistently || log_warn "Failed to set up CUDA path persistently."
+    create_cuda_symlink || log_warn "Failed to create CUDA symbolic link."
+    
+    # Verify installation
+    if ! $skip_verify; then
+        verify_cuda || log_warn "CUDA verification failed. Installation may be incomplete or incompatible."
+    else
+        log_info "Skipping verification as requested."
+    fi
+    
+    # Print final system info
+    print_system_info
+    print_final_instructions
+    
+    log_header "CUDA Setup Complete"
+    log_success "CUDA has been successfully installed and configured!"
+    
     return 0
 }
 
-# --- Main Execution Logic ---
-main() {
-    log_step "Starting CUDA Installation Script"
-
-    if ! check_nvidia_gpu; then
-        exit 1
-    fi
-
-    cuda_status=2 # 0=matching version, 1=different/unknown version or driver/toolkit mismatch, 2=nothing found
-    check_cuda_installed
-    cuda_status=$?
-
-    if [ $cuda_status -eq 0 ]; then
-        log_success "Matching CUDA version ($CUDA_VERSION_TARGET) already installed. Verification recommended."
-        read -p "Do you want to proceed with verification anyway? [y/N]: " -r response
-        if [[ "$response" =~ ^[Yy]$ ]]; then
-            if ! setup_cuda_env_instructions; then exit 1; fi
-            if ! verify_cuda; then exit 1; fi
-            log_success "Verification successful."
-        else
-            log_info "Skipping verification. Exiting."
-            exit 0
-        fi
-    else
-        if [ $cuda_status -eq 1 ]; then
-            log_warn "Existing CUDA installation or driver found, but it doesn't match the target version ($CUDA_VERSION_TARGET) or is incomplete."
-            read -p "Do you want to attempt installation of CUDA $CUDA_VERSION_TARGET anyway? This might overwrite or conflict with existing components. [y/N]: " -r response
-            if [[ ! "$response" =~ ^[Yy]$ ]]; then
-                log_info "Aborting installation as requested."
-                exit 0
-            fi
-        fi
-
-        log_info "Proceeding with CUDA $CUDA_VERSION_TARGET installation."
-        # Try Network Repo method first as it's generally more reliable
-        if install_cuda_network_repo; then
-            log_success "CUDA installation via Network Repo successful."
-        else
-            log_warn "Network Repo installation method failed. Attempting Local Deb method..."
-            if install_cuda_local_deb; then
-                log_success "CUDA installation via Local Deb successful."
-            else
-                log_error "Both Network Repo and Local Deb installation methods failed."
-                log_error "Please check the logs above for specific errors."
-                log_error "Common issues include network problems, incorrect OS/version detection, or incompatible hardware/drivers."
-                exit 1
-            fi
-        fi
-
-        # Post-install steps
-        if ! setup_cuda_env_instructions; then exit 1; fi
-        if ! verify_cuda; then exit 1; fi
-    fi
-
-    log_step "CUDA Installation and Verification Complete!"
-    log_success "Remember to configure your shell environment as instructed above."
-}
-
-# --- Run Main Function ---
-main
-
-exit 0
+# --- Execute Main Function ---
+main "$@"
