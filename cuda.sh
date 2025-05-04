@@ -3,10 +3,6 @@
 set -e
 set -o pipefail
 
-# --- Configuration ---
-CUDA_VERSION_TARGET="12.8"
-CUDA_VERSION_MAJOR_MINOR="12-8"
-
 # --- Stylish Logging ---
 # Check if tput is available for more advanced styling
 if command -v tput >/dev/null 2>&1; then
@@ -98,6 +94,31 @@ require_command lspci pciutils
 
 # --- System Information ---
 log_step "Gathering System Information"
+
+# --- Detect Compatible CUDA Version from Driver ---
+log_step "Detecting Compatible CUDA Version from NVIDIA Driver"
+
+CUDA_VERSION_TARGET=""
+CUDA_VERSION_MAJOR_MINOR=""
+
+if check_command nvidia-smi; then
+    DETECTED_CUDA_VERSION=$(nvidia-smi | grep -oP 'CUDA Version: \K[\d.]+' || echo "")
+    if [ -n "$DETECTED_CUDA_VERSION" ]; then
+        CUDA_VERSION_TARGET="$DETECTED_CUDA_VERSION"
+        CUDA_VERSION_MAJOR_MINOR=$(echo "$CUDA_VERSION_TARGET" | sed 's/\./-/')
+        log_success "Detected compatible CUDA version from driver: $CUDA_VERSION_TARGET"
+    else
+        log_warn "Could not parse CUDA version from nvidia-smi output."
+    fi
+else
+    log_warn "nvidia-smi not found. Skipping CUDA version detection from driver."
+fi
+
+if [ -z "$CUDA_VERSION_TARGET" ]; then
+    CUDA_VERSION_TARGET="12.2"
+    CUDA_VERSION_MAJOR_MINOR="12-2"
+    log_warn "Falling back to default CUDA version: $CUDA_VERSION_TARGET"
+fi
 
 OS_ID=""
 OS_VERSION_ID=""
